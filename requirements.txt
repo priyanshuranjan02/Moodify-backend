@@ -1,0 +1,7 @@
+requests
+transformers
+torch
+flask
+flask-cors
+gunicorn
+firebase-admin
