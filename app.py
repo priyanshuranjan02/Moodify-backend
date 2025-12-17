@@ -5,45 +5,37 @@ import torch
 from datetime import datetime
 import csv, io, os
 
-# ================= FIREBASE SETUP =================
-import firebase_admin
-from firebase_admin import credentials, firestore
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "moodify-firebase-key.json")
-
-cred = credentials.Certificate(FIREBASE_KEY_PATH)
-firebase_admin.initialize_app(cred)
-db = firestore.client()
-
 # ================= FLASK APP =================
 app = Flask(__name__)
 CORS(app)
 
-# ================= MODEL LOADING =================
-MODEL_NAME = "cardiffnlp/twitter-roberta-base-sentiment"
+# ================= MODEL CONFIG =================
+MODEL_NAME = "distilbert-base-uncased-finetuned-sst-2-english"
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
-model.eval()
+tokenizer = None
+model = None
 
-print("🔥 RoBERTa 3-class sentiment model loaded successfully!")
+# Reduce CPU + memory usage
+torch.set_num_threads(1)
 
-# Label mapping (official for this model)
-LABEL_MAP = {
-    0: "Negative",
-    1: "Neutral",
-    2: "Positive"
-}
+def load_model():
+    global tokenizer, model
+    if tokenizer is None or model is None:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+        model.eval()
+        print("🔥 DistilBERT model loaded")
 
-# ================= PREDICTION FUNCTION =================
+# ================= SENTIMENT LOGIC =================
 def predict_sentiment(text: str):
+    load_model()
+
     inputs = tokenizer(
         text,
         return_tensors="pt",
         truncation=True,
         padding=True,
-        max_length=512
+        max_length=256
     )
 
     with torch.no_grad():
@@ -53,8 +45,15 @@ def predict_sentiment(text: str):
     predicted = torch.argmax(probs).item()
     confidence = float(probs[0][predicted].item())
 
+    # DistilBERT labels
+    sentiment = "Positive" if predicted == 1 else "Negative"
+
+    # Neutral logic (confidence-based)
+    if confidence < 0.60:
+        sentiment = "Neutral"
+
     return {
-        "sentiment": LABEL_MAP[predicted],
+        "sentiment": sentiment,
         "confidence": round(confidence, 4)
     }
 
@@ -68,14 +67,6 @@ def predict():
         return jsonify({"error": "No text provided"}), 400
 
     result = predict_sentiment(text)
-
-    db.collection("sentiments").add({
-        "text": text,
-        "sentiment": result["sentiment"],
-        "confidence": result["confidence"],
-        "timestamp": datetime.utcnow(),
-        "source": "text"
-    })
 
     return jsonify(result)
 
@@ -109,61 +100,16 @@ def predict_csv():
 
         pred = predict_sentiment(text)
 
-        db.collection("sentiments").add({
-            "text": text,
-            "sentiment": pred["sentiment"],
-            "confidence": pred["confidence"],
-            "timestamp": datetime.utcnow(),
-            "source": "csv"
-        })
-
         results["total"] += 1
         results[pred["sentiment"].lower()] += 1
 
     return jsonify(results)
 
-# ================= HISTORY =================
-@app.route("/history", methods=["GET"])
-def history():
-    docs = (
-        db.collection("sentiments")
-        .order_by("timestamp", direction=firestore.Query.DESCENDING)
-        .limit(200)
-        .stream()
-    )
-
-    data = []
-    for doc in docs:
-        d = doc.to_dict()
-        data.append({
-            "text": d.get("text"),
-            "sentiment": d.get("sentiment"),
-            "confidence": d.get("confidence"),
-            "timestamp": d.get("timestamp").isoformat()
-        })
-
-    return jsonify(data)
-
-# ================= STATS =================
-@app.route("/stats", methods=["GET"])
-def stats():
-    docs = db.collection("sentiments").stream()
-
-    stats = {"positive": 0, "neutral": 0, "negative": 0, "total": 0}
-
-    for doc in docs:
-        s = doc.to_dict().get("sentiment", "").lower()
-        if s in stats:
-            stats[s] += 1
-        stats["total"] += 1
-
-    return jsonify(stats)
-
 # ================= ROOT =================
 @app.route("/")
 def home():
-    return "🔥 Moodify Backend (RoBERTa 3-Class) Running!"
+    return "🔥 Moodify Backend (DistilBERT + Neutral Logic) Running!"
 
 # ================= RUN =================
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    app.run(port=5000)
