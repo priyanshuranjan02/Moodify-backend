@@ -1,35 +1,42 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
-from flask_cors import CORS
 from datetime import datetime
 import csv, io, os
 
-# ====================== FIREBASE SETUP ======================
+# ================= FIREBASE SETUP =================
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# IMPORTANT:
-# Run app.py from backend folder
-# File should be located at: backend/moodify-firebase-key.json
-cred = credentials.Certificate("moodify-firebase-key.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "moodify-firebase-key.json")
+
+cred = credentials.Certificate(FIREBASE_KEY_PATH)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# ====================== FLASK APP ==========================
+# ================= FLASK APP =================
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)
 
-# ====================== LOAD DISTILBERT MODEL =========================
-MODEL_NAME = "distilbert-base-uncased-finetuned-sst-2-english"
+# ================= MODEL LOADING =================
+MODEL_NAME = "cardiffnlp/twitter-roberta-base-sentiment"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, torch_dtype=torch.float32)
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
 model.eval()
 
-print("🔥 DistilBERT model loaded successfully!")
+print("🔥 RoBERTa 3-class sentiment model loaded successfully!")
 
-# ====================== PREDICTION LOGIC ====================
+# Label mapping (official for this model)
+LABEL_MAP = {
+    0: "Negative",
+    1: "Neutral",
+    2: "Positive"
+}
+
+# ================= PREDICTION FUNCTION =================
 def predict_sentiment(text: str):
     inputs = tokenizer(
         text,
@@ -46,17 +53,12 @@ def predict_sentiment(text: str):
     predicted = torch.argmax(probs).item()
     confidence = float(probs[0][predicted].item())
 
-    label_map = {
-        0: "Negative",
-        1: "Positive"
-    }
-
     return {
-        "sentiment": label_map[predicted],
+        "sentiment": LABEL_MAP[predicted],
         "confidence": round(confidence, 4)
     }
 
-# ====================== SINGLE TEXT ====================
+# ================= TEXT ANALYSIS =================
 @app.route("/predict", methods=["POST"])
 def predict():
     data = request.json
@@ -67,7 +69,6 @@ def predict():
 
     result = predict_sentiment(text)
 
-    # Save to Firebase
     db.collection("sentiments").add({
         "text": text,
         "sentiment": result["sentiment"],
@@ -78,7 +79,7 @@ def predict():
 
     return jsonify(result)
 
-# ====================== CSV ANALYSIS ====================
+# ================= CSV ANALYSIS =================
 @app.route("/predict/csv", methods=["POST"])
 def predict_csv():
     file = request.files.get("file")
@@ -89,18 +90,14 @@ def predict_csv():
     reader = csv.DictReader(io.StringIO(content))
 
     headers = [h.lower() for h in reader.fieldnames]
-    text_col = None
-
-    for col in ["review", "reviews", "text", "content", "comment", "message"]:
-        if col in headers:
-            text_col = col
-            break
+    text_col = next((c for c in ["review", "text", "content", "comment"] if c in headers), None)
 
     if not text_col:
         return jsonify({"error": "No review/text column found"}), 400
 
     results = {
         "positive": 0,
+        "neutral": 0,
         "negative": 0,
         "total": 0
     }
@@ -121,20 +118,19 @@ def predict_csv():
         })
 
         results["total"] += 1
-        if pred["sentiment"] == "Positive":
-            results["positive"] += 1
-        else:
-            results["negative"] += 1
+        results[pred["sentiment"].lower()] += 1
 
     return jsonify(results)
 
-# ====================== HISTORY ====================
+# ================= HISTORY =================
 @app.route("/history", methods=["GET"])
 def history():
-    docs = db.collection("sentiments") \
-        .order_by("timestamp", direction=firestore.Query.DESCENDING) \
-        .limit(200) \
+    docs = (
+        db.collection("sentiments")
+        .order_by("timestamp", direction=firestore.Query.DESCENDING)
+        .limit(200)
         .stream()
+    )
 
     data = []
     for doc in docs:
@@ -148,32 +144,26 @@ def history():
 
     return jsonify(data)
 
-# ====================== STATS ====================
+# ================= STATS =================
 @app.route("/stats", methods=["GET"])
 def stats():
     docs = db.collection("sentiments").stream()
 
-    total = positive = negative = 0
+    stats = {"positive": 0, "neutral": 0, "negative": 0, "total": 0}
 
     for doc in docs:
-        s = doc.to_dict().get("sentiment", "")
-        total += 1
-        if s == "Positive":
-            positive += 1
-        else:
-            negative += 1
+        s = doc.to_dict().get("sentiment", "").lower()
+        if s in stats:
+            stats[s] += 1
+        stats["total"] += 1
 
-    return jsonify({
-        "total": total,
-        "positive": positive,
-        "negative": negative
-    })
+    return jsonify(stats)
 
-# ====================== ROOT ====================
+# ================= ROOT =================
 @app.route("/")
 def home():
-    return "🔥 Moodify Backend (DistilBERT + Firebase) Running!"
+    return "🔥 Moodify Backend (RoBERTa 3-Class) Running!"
 
-# ====================== RUN ====================
+# ================= RUN =================
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
