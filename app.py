@@ -5,6 +5,17 @@ import torch
 from datetime import datetime
 import csv, io, os
 
+# ================= FIREBASE SETUP =================
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "moodify-firebase-key.json")
+
+cred = credentials.Certificate(FIREBASE_KEY_PATH)
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
 # ================= FLASK APP =================
 app = Flask(__name__)
 CORS(app)
@@ -15,7 +26,7 @@ MODEL_NAME = "distilbert-base-uncased-finetuned-sst-2-english"
 tokenizer = None
 model = None
 
-# Reduce CPU + memory usage
+# Reduce CPU & memory usage (IMPORTANT for Render free tier)
 torch.set_num_threads(1)
 
 def load_model():
@@ -45,7 +56,6 @@ def predict_sentiment(text: str):
     predicted = torch.argmax(probs).item()
     confidence = float(probs[0][predicted].item())
 
-    # DistilBERT labels
     sentiment = "Positive" if predicted == 1 else "Negative"
 
     # Neutral logic (confidence-based)
@@ -68,6 +78,15 @@ def predict():
 
     result = predict_sentiment(text)
 
+    # Store in Firebase
+    db.collection("sentiments").add({
+        "text": text,
+        "sentiment": result["sentiment"],
+        "confidence": result["confidence"],
+        "timestamp": datetime.utcnow(),
+        "source": "text"
+    })
+
     return jsonify(result)
 
 # ================= CSV ANALYSIS =================
@@ -81,7 +100,10 @@ def predict_csv():
     reader = csv.DictReader(io.StringIO(content))
 
     headers = [h.lower() for h in reader.fieldnames]
-    text_col = next((c for c in ["review", "text", "content", "comment"] if c in headers), None)
+    text_col = next(
+        (c for c in ["review", "text", "content", "comment"] if c in headers),
+        None
+    )
 
     if not text_col:
         return jsonify({"error": "No review/text column found"}), 400
@@ -100,15 +122,65 @@ def predict_csv():
 
         pred = predict_sentiment(text)
 
+        db.collection("sentiments").add({
+            "text": text,
+            "sentiment": pred["sentiment"],
+            "confidence": pred["confidence"],
+            "timestamp": datetime.utcnow(),
+            "source": "csv"
+        })
+
         results["total"] += 1
         results[pred["sentiment"].lower()] += 1
 
     return jsonify(results)
 
+# ================= HISTORY =================
+@app.route("/history", methods=["GET"])
+def history():
+    docs = (
+        db.collection("sentiments")
+        .order_by("timestamp", direction=firestore.Query.DESCENDING)
+        .limit(200)
+        .stream()
+    )
+
+    data = []
+    for doc in docs:
+        d = doc.to_dict()
+        data.append({
+            "text": d.get("text"),
+            "sentiment": d.get("sentiment"),
+            "confidence": d.get("confidence"),
+            "timestamp": d.get("timestamp").isoformat()
+        })
+
+    return jsonify(data)
+
+# ================= STATS =================
+@app.route("/stats", methods=["GET"])
+def stats():
+    docs = db.collection("sentiments").stream()
+
+    stats = {
+        "positive": 0,
+        "neutral": 0,
+        "negative": 0,
+        "total": 0
+    }
+
+    for doc in docs:
+        s = doc.to_dict().get("sentiment", "").lower()
+        if s in stats:
+            stats[s] += 1
+        stats["total"] += 1
+
+    return jsonify(stats)
+
 # ================= ROOT =================
 @app.route("/")
 def home():
-    return "🔥 Moodify Backend (DistilBERT + Neutral Logic) Running!"
+    return "🔥 Moodify Backend (DistilBERT + Firebase) Running!"
 
 # ================= RUN =================
 if __name__ == "__main__":
